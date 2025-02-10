@@ -1,139 +1,95 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Feb 10 02:48:41 2025
+Created on Mon Feb 10 16:29:17 2025
 
 @author: thana
+
+No use of face detection
 """
 
 import os
-import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
-import torchvision.models as models
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader
+from torchvision.models import wide_resnet50_2  # ใช้ Wide ResNet
 
-# ==========================
-# 1️⃣ ตั้งค่าพื้นฐาน
-# ==========================
-IMG_SIZE = 224
-BATCH_SIZE = 32
-EPOCHS = 10
-LEARNING_RATE = 0.001
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 📌 1. กำหนด Paths
+dataset_path = r"D:\University\3\3_2\Indus based\AGE_Detection\Datasets"
+save_model_path = r"D:\University\3\3_2\Indus based\AGE_Detection\Model\age_model.pth"
 
-# โหลด Haar cascade
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-# Transform สำหรับรูปภาพ
+# 📌 2. Define Transformations
 transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
+    transforms.Resize((224, 224)),  # Resize เป็น 224x224
+    transforms.ToTensor(),          # แปลงเป็น Tensor
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize แบบ ImageNet
 ])
 
-# ==========================
-# 2️⃣ Custom Dataset (ใช้ Haar Cascade)
-# ==========================
-class AgeDataset(Dataset):
-    def __init__(self, root_dir):
-        self.root_dir = root_dir
-        self.classes = sorted(os.listdir(root_dir))  # อ่านโฟลเดอร์ 0_Child, 1_Teenager, ...
-        self.image_paths = []
-        self.labels = []
+# 📌 3. Load Dataset
+dataset = datasets.ImageFolder(root=dataset_path, transform=transform)
+train_size = int(0.8 * len(dataset))  # 80% Train, 20% Validation
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-        # วนลูปโหลดรูปจากโฟลเดอร์ตามคลาส
-        for class_folder in self.classes:
-            class_label = int(class_folder.split("_")[0])  # ดึง label จากชื่อโฟลเดอร์
-            class_path = os.path.join(root_dir, class_folder)
+# 📌 4. Create Dataloaders
+batch_size = 32
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-            for img_file in os.listdir(class_path):
-                if img_file.endswith(".jpg") or img_file.endswith(".png"):
-                    self.image_paths.append(os.path.join(class_path, img_file))
-                    self.labels.append(class_label)
+# 📌 5. Load WRN-16-8 Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = wide_resnet50_2(pretrained=True)  # โหลด Wide ResNet ตัวใหญ่ขึ้นแทน WRN-16-8
+model.fc = nn.Linear(model.fc.in_features, 5)  # เปลี่ยน Fully Connected Layer เป็น 5 Classes
+model = model.to(device)
 
-    def __len__(self):
-        return len(self.image_paths)
+# 📌 6. Define Loss & Optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # แปลงเป็น RGB
-        label = self.labels[idx]
+# 📌 7. Train Model
+num_epochs = 10
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    correct, total = 0, 0
 
-        # ตรวจจับใบหน้าด้วย Haar cascade
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
 
-        if len(faces) > 0:
-            x, y, w, h = faces[0]  # ใช้ใบหน้าแรกที่เจอ
-            face_crop = image[y:y+h, x:x+w]
-            face_pil = Image.fromarray(face_crop)
-        else:
-            face_pil = Image.fromarray(image)  # ถ้าไม่เจอใบหน้า ใช้รูปเต็มแทน
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-        image = transform(face_pil)  # Resize & Normalize
-        return image, label
+        running_loss += loss.item()
+        _, predicted = torch.max(outputs, 1)
+        correct += (predicted == labels).sum().item()
+        total += labels.size(0)
 
-# ==========================
-# 3️⃣ โหลด DataLoader
-# ==========================
-train_dataset = AgeDataset("dataset")
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_acc = 100 * correct / total
+    val_loss, val_acc = 0.0, 0.0
 
-# ==========================
-# 4️⃣ โมเดล WRN-16-8 + DMTL (Pretrained)
-# ==========================
-class AgeClassifier(nn.Module):
-    def __init__(self, num_classes=5):
-        super(AgeClassifier, self).__init__()
-        self.backbone = models.wide_resnet50_2(pretrained=True)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_features, num_classes)  # เปลี่ยน Fully Connected Layer
-
-    def forward(self, x):
-        return self.backbone(x)
-
-# ==========================
-# 5️⃣ เทรนโมเดล
-# ==========================
-def train_model():
-    model = AgeClassifier(num_classes=5).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
-
-        for images, labels in train_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-            optimizer.zero_grad()
+    # 📌 8. Validate Model
+    model.eval()
+    with torch.no_grad():
+        correct, total = 0, 0
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            val_loss += loss.item()
 
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
+            _, predicted = torch.max(outputs, 1)
             correct += (predicted == labels).sum().item()
             total += labels.size(0)
 
-        acc = 100 * correct / total
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.4f} | Accuracy: {acc:.2f}%")
+        val_acc = 100 * correct / total
 
-    # บันทึกโมเดล
-    torch.save(model.state_dict(), "age_detection_model.pth")
-    print("✅ โมเดลถูกบันทึกแล้ว!")
+    print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {running_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
 
-# ==========================
-# 🔥 เริ่มเทรน
-# ==========================
-if __name__ == "__main__":
-    train_model()
-
+# 📌 9. Save Model
+torch.save(model.state_dict(), save_model_path)
+print(f"✅ Model saved at {save_model_path}")
